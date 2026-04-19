@@ -32,21 +32,52 @@ class OratsProvider:
     实现 DataProvider Protocol，通过 httpx.AsyncClient 异步请求 ORATS API。
     支持 JSON 和 CSV 两种响应格式，对高 OI 标的推荐使用 CSV 以减少传输体积。
 
+    client 参数可选:
+    - 若外部注入 client，Provider 不负责其生命周期（调用方管理）
+    - 若不注入，Provider 在首次请求时惰性创建内部 client，并在 close() 时负责关闭
+
     Attributes:
         api_token: ORATS API 认证令牌
         base_url:  API 基础 URL
-        client:    httpx 异步客户端实例（外部注入，便于连接池复用和测试 mock）
+        client:    httpx 异步客户端实例（可选外部注入，便于连接池复用和测试 mock）
     """
 
     def __init__(
         self,
         api_token: str,
-        client: httpx.AsyncClient,
+        client: httpx.AsyncClient | None = None,  # 可选，None 时惰性创建内部实例
         base_url: str = "https://api.orats.io/datav2",
     ) -> None:
         self._token = api_token
         self._base_url = base_url.rstrip("/")
         self._client = client
+        self._owns_client = client is None  # 标记是否由本实例负责关闭 client
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """获取或惰性创建 HTTP 客户端。
+
+        外部注入时直接返回；未注入时在首次调用时创建，避免在 __init__ 中建立连接。
+        """
+        if self._client is None:
+            self._client = httpx.AsyncClient()
+        return self._client
+
+    async def close(self) -> None:
+        """关闭内部创建的 HTTP 客户端。
+
+        仅当 client 由本实例内部创建时执行关闭操作；外部注入的 client 由调用方管理。
+        """
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def __aenter__(self) -> "OratsProvider":
+        """支持 async with 语法，返回自身。"""
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        """退出 async with 块时关闭内部 client。"""
+        await self.close()
 
     # ──────────────────────────────────────────────
     # 公共接口方法
@@ -205,7 +236,8 @@ class OratsProvider:
         if use_csv:
             url += ".csv"
 
-        response = await self._client.get(url, params=params)
+        client = await self._get_client()
+        response = await client.get(url, params=params)
 
         # 统一错误处理: HTTP 错误转为自定义异常
         if response.status_code != 200:
